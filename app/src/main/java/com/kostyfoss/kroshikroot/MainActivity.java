@@ -24,7 +24,7 @@ public class MainActivity extends AppCompatActivity {
                 if (apiLevel >= 29 && apiLevel <= 32) {
                     Toast.makeText(MainActivity.this, "Kroshik ready! KERNEL: " + kernelVersion, Toast.LENGTH_SHORT).show();
 
-                    boolean isVulnerable = ExploitEngine.runKroshikExploit(kernelVersion);
+                    boolean isVulnerable = ExploitEngine.runKroshikExploit();
 
                     if (isVulnerable) {
                         Toast.makeText(MainActivity.this, "Exploit triggered successfully!", Toast.LENGTH_LONG).show();
