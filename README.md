@@ -1,5 +1,8 @@
 # KroshikROOT
-This is are new root for android 10-12 not a perm-root but we are will using vulnreables of kernels
-warning : there not are 100% succefully chance
-# Why i choosed that name
-named with the reason : ladoga seal kroshik is are popular ladoga seal with shlissik from Friends of Baltic Seals Rescue Foundation.
+
+This is a new root solution for Android 10-12. It is not a permanent root (non-perm root), as it exploits kernel vulnerabilities. 
+
+**Warning:** There is no 100% success rate. Use it at your own risk.
+
+## Why I chose this name
+The project is named after Kroshik, the famous Ladoga seal, and his friend Shlissik from the "Friends of Baltic Seals Rescue Foundation".
