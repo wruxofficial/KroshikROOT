@@ -1,0 +1,7 @@
+com/kostyfoss/kroshikroot/BuildConfig.java
+ com.kostyfoss.kroshikroot.BuildConfig
+com/kostyfoss/kroshikroot/ExploitEngine.java
+ com.kostyfoss.kroshikroot.ExploitEngine
+com/kostyfoss/kroshikroot/MainActivity.java
+ com.kostyfoss.kroshikroot.MainActivity
+ com.kostyfoss.kroshikroot.MainActivity$1
